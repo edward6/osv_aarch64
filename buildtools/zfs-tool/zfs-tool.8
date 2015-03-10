@@ -1,26 +1,29 @@
 .TH zfs-tool 8 "2015 JAN 30" "ZFS-FUSE"
 
 .SH NAME
-zfs-tool \- Read and copy files from(to) ZFS volumes offline.
+zfs-tool \- Operate on ZFS volumes offline.
 
 .SH SYNOPSIS
 .LP
 
 .nf
-\fBzfs-tool\fR [\fB-r\fR | \fB-w\fR] [\fB-i\fR | \fB--input-file\fR \fIPATHNAME\fR] [\fB-o\fR | \fB--output-file\fR \fIPATHNAME\fR] [\fB-m\fR |\fB--mount-point\fR \fIPATHNAME\fR] \fIvolume\fR
+\fBzfs-tool\fR [\fB-r\fR | \fB-w\fR | \fB-s\fR | \fB-d\fR] [\fB-f\fR | \fB--from-file\fR \fIPATHNAME\fR] [\fB-n\fR | \fB--new-file\fR \fIPATHNAME\fR] [\fB-t\fR | \fB--symlink-targer\fR \fIPATHNAME\fR] [\fB-m\fR |\fB--mount-point\fR \fIPATHNAME\fR] \fIvolume\fR
 .fi
 
 
 .SH DESCRIPTION
 .LP
 \fBzfs-tool\fR is an utility to operate with ZFS volumes "offline",
-that is without any service of kernel ZFS and FUSE modules.
-The following operations are currently supported:
+that is without any participation of kernel ZFS and FUSE modules.
+Currently the following operations are supported:
 
-1) Read a file. This operation reads a specified input file of zfs volume to standard output;
+1) Read a file. This operation reads a specified file of ZFS volume to standard output;
 
-2) Copy a file. This operation copies the input file to the specified location (output file) on ZFS volume.
+2) Copy a file. This operation copies a specified file to specified location on ZFS volume;
 
+3) Create a directory (mkdir). This operation creates a directory of specified name on ZFS volume;
+
+4) Create a symlink. This operation creates a symbolic link on ZFS volume.
 
 .SH OPTIONS
 .TP
@@ -28,12 +31,20 @@ The following operations are currently supported:
 Mount point that was specified at pool creation time.
 
 .TP
-\fB\-i\fR | \fB--input-file\fR <PATHNAME>
-Specifies the input file to read or copy from.
+\fB\-f\fR | \fB--from-file\fR <PATHNAME>
+Specifies a file to read or copy from.
 
 .TP
-\fB\-o\fR | \fB--output-file\fR <PATHNAME>
-Specifies the output file on ZFS volume (for copy operation).
+\fB\-n\fR | \fB--new-file\fR <PATHNAME>
+Specifies a new file for copy, symlink or mkdir operation.
+
+.TP
+\fB\-t\fR | \fB--symlink-targer\fR <PATHNAME>
+Specifies target of symlink to be created.
+
+.TP
+\fB\-d\fR | \fB\--dir\fR
+Specifies mkdir operation.
 
 .TP
 \fB\-r\fR | \fB\--read\fR
@@ -43,18 +54,52 @@ Specifies read operation.
 \fB\-w\fR | \fB\--write\fR
 Specifies copy operation.
 
+.TP
+\fB\-s\fR | \fB\--symlink\fR
+Specifies operation of symlink creation.
 
 .SH "NOTES"
 .LP
 
-This utility can not create directories and can not traverse semantic trees on ZFS volumes.
-So, all input files of ZFS volumes should be in root directories. Respectively, all output
-files will be created only in root directories. In particular, all files of ZFS volumes
-should be specified by short (relative) names.
+This tool doesn't support relative pathnames.
+Only absolute pathnames are allowed. Leading
+slash can be omitted.
+If the last component in the pathname is a symlink,
+then it will be resolved.
+
+.SH "EXAMPLES"
+.LP
+
+
+
+1) Create a directory mydir on ZFS image mypool:
+
+# ./zfs-tool -d -n mydir mypool
+
+
+2) Copy a file /etc/services to the new directory:
+
+# ./zfs-tool -w -f /etc/services -n mydir/foo mypool
+
+
+3) Read the newly created file to the standard output:
+
+# ./zfs-tool -r -f mydir/foo mypool
+
+
+4) Create a symlink mylink to the file mydir/foo:
+
+# ./zfs-tool -s -n mylink -t mydir/foo mypool
+
+
+5) Read a file mylink/foo using the symlink:
+
+# ./zfs-tool -r -f mylink mypool
+
 
 .SH "BUGS"
 .LP
-If there is a running zfs-fuse daemon in the system, then copy operation won't make any effect.
+If there is a running zfs-fuse daemon in the system, then creating operations won't make any effect.
 
 .SH "AUTHORS"
 .LP
@@ -62,4 +107,5 @@ Edward Shishkin <edward.shishkin@gmail.com>.
 
 .SH "SEE ALSO"
 .BR zpool (8),
-.BR zfs (8).
+.BR zfs (8),
+.BR path_resolution (7).

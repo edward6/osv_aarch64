@@ -35,6 +35,7 @@
 #include "zfs_operations.h"
 #include "util.h"
 
+#define MAX_NESTED_LINKS    (8)
 #define ZFS_USERSPACE_DEBUG (1)
 /*
  * ZFS user-space operations.
@@ -47,15 +48,22 @@
 extern vfsops_t *zfs_vfsops;
 extern int zfs_vfsinit(int fstype, char *name);
 
+static int zfs_path_walk(vfs_t *vsf, char *path,
+			 int start_lookup_dir, int *result,
+			 char **short_name);
+
 typedef enum zfs_userspace_action {
 	ZFS_USERSPACE_UNKNOWN_ACT,
 	ZFS_USERSPACE_READ_ACT,
 	ZFS_USERSPACE_WRITE_ACT,
+	ZFS_USERSPACE_MKDIR_ACT,
+	ZFS_USERSPACE_SYMLINK_ACT,
 } zfs_userspace_action_t;
 
 static char *zfs_spec = NULL;
-static char *src_file = NULL;
-static char *dst_file = NULL;
+static char *from_file = NULL;
+static char *new_file = NULL;
+static char *symlink_target = NULL;
 static char *mount_point = NULL;
 static zfs_userspace_action_t action = ZFS_USERSPACE_UNKNOWN_ACT;
 
@@ -299,11 +307,11 @@ static int zfs_userspace_open(vfs_t *vfs, int fflags, int ino,
 	return zfs_userspace_opencreate(vfs, fflags, ino, 0, name, info);
 }
 
-static int zfs_userspace_create(vfs_t *vfs, int fflags, int ino,
-				mode_t createmode,
-				const char *name, file_info_t *info)
+static int zfs_userspace_create(vfs_t *vfs, int fflags, int parent_ino,
+				mode_t createmode, const char *name,
+				file_info_t *info)
 {
-	return zfs_userspace_opencreate(vfs, fflags, ino,
+	return zfs_userspace_opencreate(vfs, fflags, parent_ino,
 					createmode, name, info);
 }
 
@@ -328,6 +336,152 @@ static int zfs_userspace_release(vfs_t *vfs, int ino, file_info_t *info)
 	ZFS_EXIT(zfsvfs);
 	if (error)
 		printf("zfs userspace release failed");
+	return error;
+}
+
+/*
+ * @parent_ino - inode of directory where to create
+ * @name - short name of directory to create
+ */
+static int zfs_userspace_mkdir(vfs_t *vfs, int parent_ino, const char *name,
+			       mode_t mode, file_info_t *info)
+{
+	zfsvfs_t *zfsvfs = vfs->vfs_data;
+
+	ZFS_ENTER(zfsvfs);
+	
+	znode_t *znode;
+
+	int error = zfs_zget(zfsvfs, parent_ino, &znode, B_FALSE);
+	if(error) {
+		ZFS_EXIT(zfsvfs);
+		/* If the inode we are trying to get was recently deleted
+		   dnode_hold_impl will return EEXIST instead of ENOENT */
+		return error == EEXIST ? ENOENT : error;
+	}
+
+	ASSERT(znode != NULL);
+	vnode_t *dvp = ZTOV(znode);
+	ASSERT(dvp != NULL);
+
+	vnode_t *vp = NULL;
+
+	vattr_t vattr = { 0 };
+	vattr.va_type = VDIR;
+	vattr.va_mode = mode & PERMMASK;
+	vattr.va_mask = AT_TYPE | AT_MODE;
+
+	cred_t cred;
+	userspace_get_cred(&cred);
+
+	error = VOP_MKDIR(dvp, (char *) name, &vattr, &vp, &cred, NULL, 0, NULL);
+	if(error)
+		goto out;
+
+	ASSERT(vp != NULL);
+ out:
+	if(vp != NULL)
+		VN_RELE(vp);
+	VN_RELE(dvp);
+
+	ZFS_EXIT(zfsvfs);
+	return error;
+}
+
+/*
+ * @name - short name of the symlink to be created
+ * @link - target of the symlink
+ * @parent - inode of directory where to create symlink
+ */
+static int zfs_userspace_symlink(vfs_t *vfs, int parent,
+				 const char *link, const char *name,
+				 file_info_t *info)
+{
+	if(strlen(name) >= MAXNAMELEN)
+		return ENAMETOOLONG;
+
+	zfsvfs_t *zfsvfs = vfs->vfs_data;
+
+	ZFS_ENTER(zfsvfs);
+
+	znode_t *znode;
+
+	int error = zfs_zget(zfsvfs, parent, &znode, B_FALSE);
+	if(error) {
+		ZFS_EXIT(zfsvfs);
+		/* If the inode we are trying to get was recently deleted
+		   dnode_hold_impl will return EEXIST instead of ENOENT */
+		return error == EEXIST ? ENOENT : error;
+	}
+
+	ASSERT(znode != NULL);
+	vnode_t *dvp = ZTOV(znode);
+	ASSERT(dvp != NULL);
+
+	cred_t cred;
+	userspace_get_cred(&cred);
+
+	vattr_t vattr;
+	vattr.va_type = VLNK;
+	vattr.va_mode = 0777;
+	vattr.va_mask = AT_TYPE | AT_MODE;
+
+	error = VOP_SYMLINK(dvp, (char *) name, &vattr, (char *) link, &cred, NULL, 0);
+
+	vnode_t *vp = NULL;
+
+	if(error)
+		goto out;
+
+	error = VOP_LOOKUP(dvp, (char *) name, &vp, NULL, 0, NULL, &cred, NULL, NULL, NULL);
+	if(error)
+		goto out;
+	ASSERT(vp != NULL);
+ out:
+	if(vp != NULL)
+		VN_RELE(vp);
+	VN_RELE(dvp);
+
+	ZFS_EXIT(zfsvfs);
+	return error;
+}
+
+static int zfs_userspace_readlink(vfs_t *vfs, int link_ino, char *buffer)
+{
+	zfsvfs_t *zfsvfs = vfs->vfs_data;
+
+	ZFS_ENTER(zfsvfs);
+	znode_t *znode;
+
+	int error = zfs_zget(zfsvfs, link_ino, &znode, B_FALSE);
+	if(error) {
+		ZFS_EXIT(zfsvfs);
+		return error;
+	}
+	ASSERT(znode != NULL);
+	vnode_t *vp = ZTOV(znode);
+	ASSERT(vp != NULL);
+
+	iovec_t iovec;
+	uio_t uio;
+	uio.uio_iov = &iovec;
+	uio.uio_iovcnt = 1;
+	uio.uio_segflg = UIO_SYSSPACE;
+	uio.uio_fmode = 0;
+	uio.uio_llimit = RLIM64_INFINITY;
+	iovec.iov_base = buffer;
+	iovec.iov_len = sizeof(buffer) - 1;
+	uio.uio_resid = iovec.iov_len;
+	uio.uio_loffset = 0;
+
+	cred_t cred;
+	userspace_get_cred(&cred);
+
+	error = VOP_READLINK(vp, &uio, &cred, NULL);
+
+	VN_RELE(vp);
+	ZFS_EXIT(zfsvfs);
+
 	return error;
 }
 
@@ -454,9 +608,58 @@ static void zfs_userspace_fini(void)
 	libsolkerncompat_exit();
 }
 
-#define REAL_INO (3)
+#define ROOT_INODE (3)
+#define MKDIR_MODE (493)
 #define CREATE_MODE (33188)
 #define CREATE_FFLAGS (33345)
+
+static int zfs_userspace_create_dir(vfs_t *vfs, char *dirname)
+{
+	int ret;
+	file_info_t info;
+	char *short_dirname = NULL;
+	int parent;
+
+	ret = zfs_path_walk(vfs, dirname,
+			    ROOT_INODE, &parent, &short_dirname);
+	if (!ret)
+		return EEXIST;
+	if (ret != ENOENT)
+		return ret;
+	if (!short_dirname)
+		return ret;
+
+	ret = zfs_userspace_mkdir(vfs, parent,
+				  short_dirname, MKDIR_MODE, &info);
+	if (ret) 
+		printf("failed to create directory %s\n", dirname);
+	return ret;
+}
+
+static int zfs_userspace_create_symlink(vfs_t *vfs,
+					char *name, char *target_name)
+{
+	int ret;
+	file_info_t info;
+	char *short_name = NULL;
+	int parent = ROOT_INODE;
+
+	ret = zfs_path_walk(vfs, name,
+			    ROOT_INODE, &parent, &short_name);
+	if (!ret)
+		return EEXIST;
+	if (ret != ENOENT)
+		return ret;
+	if (!short_name)
+		return ret;
+	
+	ret = zfs_userspace_symlink(vfs, parent,
+				    target_name, short_name, &info);
+	if (ret)
+		printf("failed to create symlink %s for %s\n",
+		       name, target_name);
+	return ret;
+}
 
 static void read_to_stdout(char *src, int len)
 {
@@ -465,6 +668,9 @@ static void read_to_stdout(char *src, int len)
 		printf("%c", src[i]);
 }
 
+/*
+ * @filename - name of the file (absolute, or relative) to be read
+ */
 static int zfs_userspace_file_read(vfs_t *vfs, char *filename)
 {
 	int ret;
@@ -472,16 +678,18 @@ static int zfs_userspace_file_read(vfs_t *vfs, char *filename)
 	off_t offset = 0;
 	char buf[4096];
 
-	int ino;
+	int inode;
 	file_info_t info;
+	char *parent_dirname;
 
-	ret = zfs_userspace_lookup(vfs, 3, filename, &ino);
-	if (ret) {
-		printf("failed to lookup file %s\n", filename);
-		goto error;
-	}
+	/*
+	 * resolve file's name to inode
+	 */
+	ret = zfs_path_walk(vfs, filename, ROOT_INODE, &inode, &parent_dirname);
+	if (ret)
+		return ret;
 
-	ret = zfs_userspace_open(vfs, O_RDWR, ino, NULL, &info);
+	ret = zfs_userspace_open(vfs, O_RDWR, inode, NULL, &info);
 	if (ret) {
 		printf("failed to open file %s\n", filename);
 		goto error;
@@ -524,8 +732,10 @@ static int zfs_userspace_file_copy(vfs_t *vfs,
 	off_t offset = 0;
 	char buf[4096];
 
-	int ino;
 	file_info_t info;
+
+	int parent = ROOT_INODE;
+	char *short_dst_file_name;
 
 	fd = open(src_file_name, O_RDONLY);
 	if (fd < 0) {
@@ -533,11 +743,22 @@ static int zfs_userspace_file_copy(vfs_t *vfs,
 		return 1;
 	}
 	/*
+	 * resolve destination path
+	 */
+	ret = zfs_path_walk(vfs, dst_file_name,
+			    ROOT_INODE, &parent, &short_dst_file_name);
+	if (!ret)
+		return EEXIST;
+	if (ret != ENOENT)
+		return ret;
+	if (!short_dst_file_name)
+		return ret;
+	/*
 	 * create a file on ZFS volume
 	 */
 	ret = zfs_userspace_create(vfs,
-				   CREATE_FFLAGS, 3,
-				   CREATE_MODE, dst_file_name, &info);
+				   CREATE_FFLAGS, parent,
+				   CREATE_MODE, short_dst_file_name, &info);
 	if (ret) {
 		printf("failed to create output file %s\n", dst_file_name);
 		goto error;
@@ -546,7 +767,7 @@ static int zfs_userspace_file_copy(vfs_t *vfs,
 	while (1) {
 		ssize_t nwritten;
 
-		nread = read(fd, buf, 4096);
+		nread = read(fd, buf, sizeof(buf));
 		if (nread <= 0)
 			break;
 
@@ -587,6 +808,194 @@ static int zfs_userspace_file_copy(vfs_t *vfs,
 	return 1;
 }
 
+/*
+ * return length of the current path component
+ */
+static int short_name_len(char *name)
+{
+	int len = 0;
+	int c = (unsigned char)*name;
+	do {
+		len++;
+		c = (unsigned char)name[len];
+	} while (c && c != '/');
+	return len;
+}
+
+static enum vtype type_of_file(int inode, vfs_t *vfs)
+{
+	int error;
+	znode_t *znode;	
+	zfsvfs_t *zfsvfs = vfs->vfs_data;
+	vnode_t *vp;
+
+	error = zfs_zget(zfsvfs, inode, &znode, B_TRUE);
+	if (error)
+		return VBAD;
+	ASSERT(znode != NULL);
+	vp = ZTOV(znode);
+	ASSERT(vp != NULL);
+
+	return vp->v_type;
+}
+
+/*
+ * Resolve symlink with inode number @symlink_ino
+ * and put result to @result.
+ */
+static int resolve_symlink(vfs_t *vfs,
+			   int start_lookup_dir, int symlink_ino, int *result)
+{
+	int ret;
+	int res = 0;
+	char *last;
+	char buf[PATH_MAX + 1];
+
+	memset(buf, 0, sizeof(buf));
+	/*
+	 * evaluate symlink 
+	 */
+	ret = zfs_userspace_readlink(vfs, symlink_ino, buf);
+	if (ret) {
+		printf("failed to read link (%d)\n", ret);
+		return ret;
+	}
+	if (buf[0] == '/')
+		start_lookup_dir = ROOT_INODE;
+
+	ret = zfs_path_walk(vfs, buf, start_lookup_dir, &res, &last);
+	if (ret)
+		/*
+		 * All components of symlink has to be found.
+		 */
+		return ret;
+	*result = res;
+	return 0;
+}
+
+/*
+ * Procedure of name resolution (see path_resolution (7))
+ * This is recursive because of need to resolve symlinks.
+ * Convert path name to inode number.
+ *
+ * Inode number of the last found component is stored in @result.
+ * Name of the last not found component is stored in @last_not_found
+ *
+ */
+static int zfs_path_walk(vfs_t *vfs, char *path,
+			 int start_lookup_dir, int *result,
+			 char **last_not_found)
+{
+	int ret;
+	char *name; /* short name of the current component */
+	int name_len;
+	int nr_followed = 0;
+	int lookup_dir = start_lookup_dir;
+
+	*result = start_lookup_dir;
+	name = path;
+	/*
+	 * skip slashes 
+	 */
+	while (*name == '/')
+		name++;
+	if (!*name)
+		return 0;
+	/*
+	 * we have a real path component
+	 */
+	while (1) {
+		char c;
+		static enum vtype type;
+		int lookup_result;
+
+		name_len = short_name_len(name);
+		ASSERT(name_len != 0);
+		c = name[name_len];
+		ASSERT(c == '/' || c == 0);
+
+		name[name_len] = 0;
+
+		ret = zfs_userspace_lookup(vfs, lookup_dir,
+					   name, &lookup_result);
+		name[name_len] = c;
+
+		if (ret == ENOENT && c == 0) {
+			/*
+			 * Last component not found
+			 */
+			*last_not_found = name;
+			*result = lookup_dir;
+		}
+		if (ret) {
+			if (ret != ENOENT)
+				printf("lookup failed (%d)\n", ret);
+			return ret;
+		}
+		type = type_of_file(lookup_result, vfs);
+
+		if (c != 0 && type != VDIR && type != VLNK)
+			return ENOTDIR;
+	handle_by_type:
+
+		switch (type) {
+		case VLNK:
+			if (nr_followed >= MAX_NESTED_LINKS)
+				return ELOOP;
+			/*
+			 * this will update lookup_result with
+			 * the result of symlink resolution
+			 */
+			ret = resolve_symlink(vfs, lookup_dir,
+					      lookup_result, &lookup_result);
+			if (ret)
+				return ret;
+			nr_followed ++;
+			type = type_of_file(lookup_result, vfs);
+			goto handle_by_type;
+		case VDIR:
+			if (c == 0) {
+				/*
+				 * final component
+				 */
+				*result = lookup_result;
+				return 0;
+			}
+			name += name_len;
+			/*
+			 * skip slashes
+			 */
+			do {
+				name++;
+			} while (*name == '/');
+			if (!*name) {
+				/*
+				 * it was a final component
+				 * with trailing slashes
+				 */
+				*result = lookup_result;
+				return 0;
+			}
+			/*
+			 * we have a real path component
+			 * to be lookup-ed
+			 */
+			lookup_dir = lookup_result;
+			continue;
+		case VREG:
+			/*
+			 * we know there is no trailing slashes
+			 */
+			ASSERT(c == 0);
+			*result = lookup_result;
+			return 0;
+		default:
+			printf("bad file type: %d\n", type);
+			return -1;
+		}
+	}
+}
+
 extern char *optarg;
 extern int optind, opterr, optopt;
 
@@ -596,15 +1005,25 @@ static struct option longopts[] = {
 	  NULL, /* flag */
 	  'm'
 	},
-	{ "input-file",
+	{ "from-file",
 	  1,
 	  NULL,
-	  'i'
+	  'f'
 	},
-	{ "output-file",
+	{ "new-file",
 	  1,
 	  NULL,
-	  'o'
+	  'n'
+	},
+	{ "symlink-target",
+	  1,
+	  NULL,
+	  't'
+	},
+	{ "dir",
+	  0,
+	  NULL,
+	  'd'
 	},
 	{ "read",
 	  0,
@@ -615,6 +1034,11 @@ static struct option longopts[] = {
 	  0,
 	  NULL,
 	  'w'
+	},
+	{ "symlink",
+	  0,
+	  NULL,
+	  's'
 	},
 	{ "help",
 	  0,
@@ -634,14 +1058,20 @@ static void print_usage(int argc, char *argv[])
 		"Options:\n"
 		"  -m PATHNAME, --mount-point PATHNAME\n"
 		"			Specifies ZFS mount point.\n"
-		"  -i PATHNAME, --input-file PATHNAME\n"
-		"			Specifies input file name.\n"
-		"  -o PATHNAME, --output-file PATHNAME\n"
-		"			Specifies file name on the ZFS volume.\n"
+		"  -f PATHNAME, --from-file PATHNAME\n"
+		"			Specifies input file for copy and read operations.\n"
+		"  -n PATHNAME, --new-file PATHNAME\n"
+		"			Specifies new file name for copy, symlink and mkdir opeatations.\n"
+		"  -t PATHNAME, --symlink-target PATHNAME\n"
+		"			Specifies target file for new symlink creation.\n"
+		"  -d, --dir\n"
+		"			Create directory on ZFS volume.\n"
 		"  -r, --read\n"
-		"			read input file to the standard output.\n"
+		"			Read input file to the standard output.\n"
 		"  -w, --write\n"
-		"			copy input file to the ZFS volume.\n"
+		"			Copy input file to the ZFS volume.\n"
+		"  -s, --symlink\n"
+		"			Create a symlink on ZFS volume.\n"
 		"  -h, --help\n"
 		"			Show this usage summary.\n"
 		, progname);
@@ -652,7 +1082,7 @@ int parse_args(int argc, char *argv[])
 	int retval;
 	const char *progname = argv[0];
 
-	while ((retval = getopt_long(argc, argv, "-hrwm:i:o:", longopts, NULL)) != -1) {
+	while ((retval = getopt_long(argc, argv, "-hrwsdm:f:n:t:", longopts, NULL)) != -1) {
 		switch(retval) {
 		case 1: /* non-option argument passed */
 			zfs_spec = optarg;
@@ -668,19 +1098,33 @@ int parse_args(int argc, char *argv[])
 			}
 			mount_point = optarg;
 			break;
-		case 'i':
-			if (src_file != NULL) {
+		case 'f':
+			if (from_file != NULL) {
 				print_usage(argc, argv);
 				return 1;
 			}
-			src_file = optarg;
+			from_file = optarg;
 			break;
-		case 'o':
-			if (dst_file != NULL) {
+		case 'n':
+			if (new_file != NULL) {
 				print_usage(argc, argv);
 				return 1;
 			}
-			dst_file = optarg;
+			new_file = optarg;
+			break;
+		case 't':
+			if (symlink_target != NULL) {
+				print_usage(argc, argv);
+				return 1;
+			}
+			symlink_target = optarg;
+			break;
+		case 'd':
+			if (action != ZFS_USERSPACE_UNKNOWN_ACT) {
+				print_usage(argc, argv);
+				return 1;
+			}
+			action = ZFS_USERSPACE_MKDIR_ACT;
 			break;
 		case 'r':
 			if (action != ZFS_USERSPACE_UNKNOWN_ACT) {
@@ -695,6 +1139,13 @@ int parse_args(int argc, char *argv[])
 				return 1;
 			}
 			action = ZFS_USERSPACE_WRITE_ACT;
+			break;
+		case 's':
+			if (action != ZFS_USERSPACE_UNKNOWN_ACT) {
+				print_usage(argc, argv);
+				return 1;
+			}
+			action = ZFS_USERSPACE_SYMLINK_ACT;
 			break;
 		default:
 			/*
@@ -717,22 +1168,41 @@ int parse_args(int argc, char *argv[])
 		mount_point = "";
 
 	switch (action) {
+	case ZFS_USERSPACE_MKDIR_ACT:
+		if (new_file == NULL) {
+			fprintf(stderr,
+				"specify directory name to create \n");
+			return 1;
+		}
+		break;
 	case ZFS_USERSPACE_READ_ACT:
-		if (src_file == NULL) {
+		if (from_file == NULL) {
 			fprintf(stderr,
 				"specify input file for read action\n");
 			return 1;
 		}
 		break;
 	case ZFS_USERSPACE_WRITE_ACT:
-		if (src_file == NULL) {
+		if (from_file == NULL) {
 			fprintf(stderr,
-				"specify input file for write action\n");
+				"specify source file for copy action\n");
 			return 1;
 		}
-		if (dst_file == NULL) {
+		if (new_file == NULL) {
 			fprintf(stderr,
-				"specify output file for write action\n");
+				"specify new file for copy action\n");
+			return 1;
+		}
+		break;		
+	case ZFS_USERSPACE_SYMLINK_ACT:
+		if (new_file == NULL) {
+			fprintf(stderr,
+				"specify name of new symlink\n");
+			return 1;
+		}
+		if (symlink_target == NULL) {
+			fprintf(stderr,
+				"specify target file for new symlink\n");
 			return 1;
 		}
 		break;
@@ -759,10 +1229,18 @@ int main(int argc, char *argv[])
 
 	switch (action) {
 	case ZFS_USERSPACE_READ_ACT:
-		ret = zfs_userspace_file_read(vfs, src_file);
+		ret = zfs_userspace_file_read(vfs, from_file);
 		break;
 	case ZFS_USERSPACE_WRITE_ACT:
-		ret = zfs_userspace_file_copy(vfs, src_file, dst_file);
+		ret = zfs_userspace_file_copy(vfs, from_file, new_file);
+		break;
+	case ZFS_USERSPACE_MKDIR_ACT:
+		ret = zfs_userspace_create_dir(vfs, new_file);
+		break;
+	case ZFS_USERSPACE_SYMLINK_ACT:
+		ret = zfs_userspace_create_symlink(vfs,
+						   new_file,
+						   symlink_target);
 		break;
 	default:
 		break;
@@ -780,3 +1258,14 @@ int main(int argc, char *argv[])
 	zfs_userspace_fini();
 	exit(EXIT_FAILURE);
 }
+
+/*
+  Local variables:
+  c-indentation-style: "K&R"
+  mode-name: "LC"
+  c-basic-offset: 8
+  tab-width: 8
+  fill-column: 80
+  scroll-step: 1
+  End:
+*/
